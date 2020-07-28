@@ -161,24 +161,7 @@ public class JointedModelColladaExporter {
     node.setId(jointIdentifier);
     node.setSid(jointIdentifier);
     node.setType(NodeType.JOINT);
-
-    Matrix matrix = factory.createMatrix();
-    matrix.setSid("matrix");
-    AffineMatrix4x4 newTransform = new AffineMatrix4x4(joint.localTransformation.getValue());
-    if (SCALE_MODEL) {
-      newTransform.translation.multiply(MODEL_SCALE);
-    }
-    double[] matrixValues = newTransform.getAsRowMajorArray16();
-    //Flip the values from Alice space to Collada space
-    if (FLIP_COORDINATE_SPACE) {
-      matrixValues = ColladaTransformUtilities.createFlippedRowMajorTransform(matrixValues);
-    }
-    for (double matrixValue : matrixValues) {
-      matrix.getValue().add(matrixValue);
-    }
-
-    node.getLookatOrMatrixOrRotate().add(matrix);
-
+    addMatrixToNode(node, joint.localTransformation.getValue());
     for (Component c : joint.getComponents()) {
       if (c instanceof Joint) {
         Node childNode = createNodeForJoint((Joint) c);
@@ -187,6 +170,13 @@ public class JointedModelColladaExporter {
     }
 
     return node;
+  }
+
+  private void addMatrixToNode(Node node, AffineMatrix4x4 transform) {
+    Matrix matrix = factory.createMatrix();
+    matrix.setSid("matrix");
+    localizeMatrix(new AffineMatrix4x4(transform), matrix.getValue());
+    node.getLookatOrMatrixOrRotate().add(matrix);
   }
 
   public String getUserJointIdentifier(String jointIdentifier) {
@@ -488,17 +478,7 @@ public class JointedModelColladaExporter {
     for (Entry<String, InverseAbsoluteTransformationWeightsPair> entry : wi.getMap().entrySet()) {
       InverseAbsoluteTransformationWeightsPair iatwp = entry.getValue();
       AffineMatrix4x4 inverseBindMatrix = iatwp.getInverseAbsoluteTransformation();
-      if (SCALE_MODEL) {
-        inverseBindMatrix.translation.multiply(MODEL_SCALE);
-      }
-      double[] matrix = inverseBindMatrix.getAsRowMajorArray16();
-      if (FLIP_COORDINATE_SPACE) {
-        //Invert matrix, flip its values from Alice space to Collada space and then invert it back
-        matrix = ColladaTransformUtilities.createFlippedRowMajorTransform(matrix);
-      }
-      for (double element : matrix) {
-        matricesArray.getValue().add(element);
-      }
+      localizeMatrix(inverseBindMatrix, matricesArray.getValue());
     }
     int matrixCount = matricesArray.getValue().size();
     matricesArray.setCount(BigInteger.valueOf(matrixCount));
@@ -506,6 +486,20 @@ public class JointedModelColladaExporter {
     matricesSource.setTechniqueCommon(createTechniqueCommonForArray(matricesArray.getId(), "float4x4", matrixCount, 16));
 
     return matricesSource;
+  }
+
+  private void localizeMatrix(AffineMatrix4x4 newTransform, List<Double> value) {
+    if (SCALE_MODEL) {
+      newTransform.translation.multiply(MODEL_SCALE);
+    }
+    double[] matrixValues = newTransform.getAsRowMajorArray16();
+    //Flip the values from Alice space to Collada space
+    if (FLIP_COORDINATE_SPACE) {
+      matrixValues = ColladaTransformUtilities.createFlippedRowMajorTransform(matrixValues);
+    }
+    for (double matrixValue : matrixValues) {
+      value.add(matrixValue);
+    }
   }
 
   private InputLocal createInputLocal(String semantic, String sourceName) {
@@ -655,6 +649,54 @@ public class JointedModelColladaExporter {
     return skin;
   }
 
+  private void addControllerForBlendShape(List<Controller> controllers, BlendShape blendShape) {
+    Controller controller = factory.createController();
+    String controllerName = blendShape.getName() + "-morph";
+    controller.setId(controllerName);
+    Morph morph = factory.createMorph();
+    morph.setSource("#" + blendShape.getName());
+    morph.setMethod(MorphMethodType.RELATIVE);
+
+    Source targetsSource = factory.createSource();
+    String targetsName = controllerName + "-targets";
+    String targetsArrayName = targetsName + "-array";
+    targetsSource.setId(targetsName);
+    NameArray nameArray = factory.createNameArray();
+    nameArray.setId(targetsArrayName);
+    for (String blendName : blendShape.getBlendNames()) {
+      nameArray.getValue().add(blendName);
+    }
+    nameArray.setCount(BigInteger.valueOf(blendShape.getBlendNames().length));
+    targetsSource.setNameArray(nameArray);
+    targetsSource.setTechniqueCommon(createTechniqueCommonForArray(targetsArrayName, "name", 1, 1));
+
+    Source weightsSource = factory.createSource();
+    String weightsName = controllerName + "-weights";
+    String weightsArrayName = weightsName + "-array";
+    weightsSource.setId(weightsName);
+    FloatArray floatArray = factory.createFloatArray();
+    floatArray.setId(weightsArrayName);
+    for (String ignored : blendShape.getBlendNames()) {
+      // TODO determine if 0 is a valid value to start with every time
+      floatArray.getValue().add(0.0);
+    }
+    floatArray.setCount(BigInteger.valueOf(blendShape.getBlendNames().length));
+    weightsSource.setFloatArray(floatArray);
+    final TechniqueCommon technique = createTechniqueCommonForArray(weightsArrayName, "float", 1, 1);
+    for (Param param : technique.getAccessor().getParam()) {
+      param.setName("WEIGHT");
+    }
+    weightsSource.setTechniqueCommon(technique);
+
+    Morph.Targets targets = factory.createMorphTargets();
+    targets.getInput().add(createInputLocal("MORPH_TARGET", targetsName));
+    targets.getInput().add(createInputLocal("MORPH_WEIGHT", weightsName));
+    morph.setTargets(targets);
+
+    controller.setMorph(morph);
+    controllers.add(controller);
+  }
+
   private void addControllersForMesh(List<Controller> controllers, WeightedMesh sgWeightedMesh) {
     for (Integer usedTextureId : sgWeightedMesh.getReferencedTextureIds()) {
       String meshName = getMeshTextureId(sgWeightedMesh, usedTextureId);
@@ -784,6 +826,22 @@ public class JointedModelColladaExporter {
       meshName = meshName + "-" + usedTextureId;
     }
     return meshName;
+  }
+
+  private void addVisualSceneNodesForBlendShape(List<Node> sceneNodes, BlendShape blendShape) {
+    for (Integer textureId : blendShape.getReferencedTextureIds()) {
+      Node visualSceneNode = createVisualSceneNode(blendShape.getName());
+
+      addMatrixToNode(visualSceneNode, AffineMatrix4x4.accessIdentity());
+
+      String controllerURL = "#" + blendShape.getName() + "-morph";
+      InstanceController instanceController = factory.createInstanceController();
+      instanceController.setUrl(controllerURL);
+      instanceController.setBindMaterial(createBindMaterialForMaterialIndex(textureId));
+      visualSceneNode.getInstanceController().add(instanceController);
+
+      sceneNodes.add(visualSceneNode);
+    }
   }
 
   private void addVisualSceneNodesForWeightedMesh(List<Node> sceneNodes, WeightedMesh sgWeightedMesh) {
@@ -954,6 +1012,11 @@ public class JointedModelColladaExporter {
     for (WeightedMesh sgWM : visual.weightedMeshes.getValue()) {
       addControllersForMesh(lc.getController(), sgWM);
       addVisualSceneNodesForWeightedMesh(visualScene.getNode(), sgWM);
+    }
+    //Create controllers for blend shapes
+    for (BlendShape sgBS : visual.blendShapes) {
+      addControllerForBlendShape(lc.getController(), sgBS);
+      addVisualSceneNodesForBlendShape(visualScene.getNode(), sgBS);
     }
     collada.getLibraryAnimationsOrLibraryAnimationClipsOrLibraryCameras().add(lc);
   }
